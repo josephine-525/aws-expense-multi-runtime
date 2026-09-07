@@ -117,7 +117,7 @@
 <body>
 
 <h1>EKS Expense App — AWS Architecture</h1>
-<p class="sub" style="margin-top:6px">ca-central-1 · <your-project-name> · EKS deployment mode</p>
+<p class="sub" style="margin-top:6px">ca-central-1 · simplestartdemo · EKS deployment mode</p>
 
 <div class="section-gap"></div>
 
@@ -141,8 +141,8 @@
   <div class="lane" style="flex:0 0 auto">
     <span class="lane-label">ECR</span>
     <div class="stack">
-      <div class="box"><div>expense-backend</div><div class="box-sub"><your-project-name>-expense-backend</div></div>
-      <div class="box"><div>expense-frontend</div><div class="box-sub"><your-project-name>-expense-frontend</div></div>
+      <div class="box"><div>expense-backend</div><div class="box-sub">simplestartdemo-expense-backend</div></div>
+      <div class="box"><div>expense-frontend</div><div class="box-sub">simplestartdemo-expense-frontend</div></div>
     </div>
   </div>
 
@@ -243,7 +243,7 @@
                 <div class="arrow"><span class="arrow-lbl">pull image</span><span class="arrow-sym">→</span></div>
                 <div class="box dim"><div>ECR backend</div></div>
               </div>
-              <p class="irsa-note">ServiceAccount: expense-backend — annotation: eks.amazonaws.com/role-arn → backend-role (DynamoDB 读写权限)</p>
+              <p class="irsa-note">ServiceAccount: expense-backend — annotation: eks.amazonaws.com/role-arn → backend-role (DynamoDB read/write permissions)</p>
             </div>
 
           </div>
@@ -287,37 +287,37 @@
 <div class="small-gap"></div>
 
 <!-- Key Config -->
-<h3>关键配置 / 今天的踩坑点</h3>
+<h3>Key Config / Gotchas Hit Along the Way</h3>
 <div class="config-grid">
   <div class="config-card">
     <div class="cfg-label">Probe path</div>
     <div class="cfg-value">GET / (not /expenses)</div>
-    <div class="cfg-note">稳定返回 200；/expenses 缺 month 参数返回 400 导致 CrashLoop</div>
+    <div class="cfg-note">Reliably returns 200; /expenses without a month param returns 400, causing CrashLoop</div>
   </div>
   <div class="config-card">
     <div class="cfg-label">IRSA</div>
     <div class="cfg-value">eks.amazonaws.com/role-arn</div>
-    <div class="cfg-note">SA annotation；本地 envsubst 未带变量会渲染为空，导致 DynamoDB 无权限</div>
+    <div class="cfg-note">SA annotation; local envsubst without the variable set renders it empty, losing DynamoDB access</div>
   </div>
   <div class="config-card">
     <div class="cfg-label">LBC keepTLSSecret</div>
     <div class="cfg-value">--set keepTLSSecret=true</div>
-    <div class="cfg-note">避免每次 helm upgrade 轮换 webhook CA，防止 x509 unknown authority</div>
+    <div class="cfg-note">Avoids rotating the webhook CA on every helm upgrade, preventing x509 unknown authority errors</div>
   </div>
   <div class="config-card">
     <div class="cfg-label">Target type</div>
-    <div class="cfg-value">ip（not instance）</div>
-    <div class="cfg-note">ALB 直接路由到 Pod IP；Pod Ready → EndpointSlice → TG target 注册</div>
+    <div class="cfg-value">ip (not instance)</div>
+    <div class="cfg-note">ALB routes directly to Pod IPs; Pod Ready → EndpointSlice → TG target registration</div>
   </div>
   <div class="config-card">
     <div class="cfg-label">ALB SG tag</div>
     <div class="cfg-value">ingress.k8s.aws/cluster</div>
-    <div class="cfg-note">LBC 通过此 tag 识别和管理 ALB SG；缺失会导致 IAM 403</div>
+    <div class="cfg-note">LBC uses this tag to identify and manage the ALB SG; missing it causes IAM 403s</div>
   </div>
   <div class="config-card">
     <div class="cfg-label">VpcId (Helm)</div>
     <div class="cfg-value">--set vpcId=&lt;vpc-id&gt;</div>
-    <div class="cfg-note">IMDS hop limit=1 时无法自动发现 VPC；CI 用 aws eks describe-cluster 动态取值</div>
+    <div class="cfg-note">VPC can't be auto-discovered when IMDS hop limit=1; CI fetches it dynamically via aws eks describe-cluster</div>
   </div>
 </div>
 
