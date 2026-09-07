@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8" />
+<title>EKS Expense App — AWS Architecture</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #1e1e1e;
+    color: #d4d4d4;
+    padding: 32px;
+    min-width: 1100px;
+  }
+  h1 { font-size: 22px; font-weight: 700; color: #fff; }
+  h2 { font-size: 13px; font-weight: 700; color: #888; text-transform: uppercase; letter-spacing: .06em; }
+  h3 { font-size: 14px; font-weight: 700; color: #ccc; margin-bottom: 10px; }
+  .sub { font-size: 11px; color: #888; margin-top: 4px; }
+  .divider { border: none; border-top: 1px solid #333; margin: 20px 0; }
+
+  /* Lane */
+  .lane {
+    border: 1px solid #3a3a3a;
+    border-radius: 10px;
+    padding: 14px 16px 16px;
+    position: relative;
+    margin-bottom: 0;
+  }
+  .lane-label {
+    position: absolute;
+    top: -11px; left: 14px;
+    background: #1e1e1e;
+    padding: 0 8px;
+    font-size: 10px;
+    font-weight: 700;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+  }
+
+  /* Box */
+  .box {
+    border: 1.5px solid #3a3a3a;
+    border-radius: 6px;
+    padding: 8px 14px;
+    background: #2a2a2a;
+    text-align: center;
+    min-width: 120px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #d4d4d4;
+  }
+  .box.accent {
+    border-color: #4e9bcd;
+    color: #4e9bcd;
+    background: #1e2d3d;
+  }
+  .box.dim {
+    background: #252525;
+    color: #888;
+  }
+  .box .box-sub { font-size: 10px; color: #666; font-weight: 400; margin-top: 3px; }
+  .box.accent .box-sub { color: #3a7aa0; }
+
+  /* Row / Stack */
+  .row { display: flex; flex-direction: row; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .stack { display: flex; flex-direction: column; gap: 10px; }
+  .flex1 { flex: 1; }
+
+  /* Arrow */
+  .arrow { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+  .arrow-lbl { font-size: 9px; color: #666; text-align: center; max-width: 80px; line-height: 1.3; }
+  .arrow-sym { font-size: 16px; color: #555; }
+
+  /* Pill */
+  .pill {
+    font-size: 10px;
+    background: #2d2d2d;
+    border: 1px solid #444;
+    border-radius: 20px;
+    padding: 2px 10px;
+    color: #aaa;
+    white-space: nowrap;
+  }
+
+  /* Traffic flow */
+  .flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .flow-arrow { font-size: 14px; color: #555; }
+  .flow-label { font-size: 9px; color: #666; text-align: center; }
+
+  /* Key config grid */
+  .config-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-top: 10px;
+  }
+  .config-card {
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 10px 14px;
+    background: #252525;
+  }
+  .config-card .cfg-label { font-size: 11px; font-weight: 700; color: #bbb; }
+  .config-card .cfg-value { font-size: 12px; color: #4e9bcd; margin: 4px 0; }
+  .config-card .cfg-note { font-size: 10px; color: #666; }
+
+  /* Dashed lane variant */
+  .lane.dashed { border-style: dashed; }
+
+  .irsa-note { font-size: 10px; color: #555; margin-top: 6px; }
+
+  .section-gap { height: 20px; }
+  .small-gap { height: 10px; }
+</style>
+</head>
+<body>
+
+<h1>EKS Expense App — AWS Architecture</h1>
+<p class="sub" style="margin-top:6px">ca-central-1 · <your-project-name> · EKS deployment mode</p>
+
+<div class="section-gap"></div>
+
+<!-- CI/CD + ECR + IAM row -->
+<div class="row" style="align-items:flex-start; gap:16px">
+
+  <div class="lane" style="flex:0 0 auto">
+    <span class="lane-label">GitLab CI/CD</span>
+    <div class="stack">
+      <div class="box"><div>build-backend</div><div class="box-sub">docker build + push</div></div>
+      <div class="box"><div>build-frontend</div><div class="box-sub">docker build + push</div></div>
+      <div class="box accent"><div>deploy-eks</div><div class="box-sub">helm + kubectl apply</div></div>
+    </div>
+  </div>
+
+  <div class="arrow" style="margin-top:40px">
+    <span class="arrow-lbl">push image</span>
+    <span class="arrow-sym">→</span>
+  </div>
+
+  <div class="lane" style="flex:0 0 auto">
+    <span class="lane-label">ECR</span>
+    <div class="stack">
+      <div class="box"><div>expense-backend</div><div class="box-sub"><your-project-name>-expense-backend</div></div>
+      <div class="box"><div>expense-frontend</div><div class="box-sub"><your-project-name>-expense-frontend</div></div>
+    </div>
+  </div>
+
+  <div class="arrow" style="margin-top:40px">
+    <span class="arrow-lbl">helm upgrade<br>kubectl apply</span>
+    <span class="arrow-sym">→</span>
+  </div>
+
+  <div class="lane" style="flex:0 0 auto">
+    <span class="lane-label">IAM / IRSA</span>
+    <div class="stack">
+      <div class="box"><div>aws-lbc-role</div><div class="box-sub">IRSA → LBC SA</div></div>
+      <div class="box"><div>backend-role</div><div class="box-sub">IRSA → expense-backend SA</div></div>
+    </div>
+  </div>
+
+</div>
+
+<hr class="divider">
+
+<!-- VPC -->
+<div class="lane">
+  <span class="lane-label">VPC · ca-central-1</span>
+  <div class="stack">
+
+    <!-- Public subnets -->
+    <div class="lane">
+      <span class="lane-label">Public Subnets (2 AZs)</span>
+      <div class="row">
+        <div class="box dim"><div>Internet Gateway</div></div>
+        <div class="arrow"><span class="arrow-sym">→</span></div>
+        <div class="box dim"><div>NAT Gateway</div></div>
+        <div class="flex1"></div>
+        <div class="box accent" style="min-width:180px"><div>ALB</div><div class="box-sub">internet-facing · k8s-expense-...</div></div>
+      </div>
+    </div>
+
+    <!-- Private subnets / EKS -->
+    <div class="lane">
+      <span class="lane-label">Private Subnets (2 AZs) · EKS Cluster</span>
+      <div class="stack">
+
+        <!-- kube-system -->
+        <div class="lane">
+          <span class="lane-label">kube-system</span>
+          <div class="row">
+            <div class="box accent" style="min-width:280px">
+              <div>aws-load-balancer-controller</div>
+              <div class="box-sub">Helm · watches Ingress / Service / EndpointSlice</div>
+            </div>
+            <div class="arrow">
+              <span class="arrow-lbl">reconciles →<br>creates/updates ALB</span>
+              <span class="arrow-sym">→</span>
+            </div>
+            <div class="box dim"><div>CoreDNS</div></div>
+            <div class="box dim"><div>kube-proxy</div></div>
+          </div>
+        </div>
+
+        <!-- namespace: expense -->
+        <div class="lane">
+          <span class="lane-label">Namespace: expense</span>
+          <div class="stack">
+
+            <!-- Ingress -->
+            <div class="row" style="align-items:center">
+              <div class="box accent" style="flex:1">
+                <div>Ingress: expense</div>
+                <div class="box-sub">alb · internet-facing · target-type: ip</div>
+              </div>
+              <span class="pill">/ → frontend:80</span>
+              <span class="pill">/expenses /months /summary → backend:8080</span>
+            </div>
+
+            <!-- Frontend -->
+            <div class="lane dashed">
+              <span class="lane-label">expense-frontend</span>
+              <div class="row">
+                <div class="box"><div>Pod ×2</div><div class="box-sub">nginx · port 80</div></div>
+                <div class="arrow"><span class="arrow-lbl">readinessProbe<br>GET /</span><span class="arrow-sym">→</span></div>
+                <div class="box"><div>Service</div><div class="box-sub">ClusterIP · port 80</div></div>
+                <div class="flex1"></div>
+                <div class="arrow"><span class="arrow-lbl">pull image</span><span class="arrow-sym">→</span></div>
+                <div class="box dim"><div>ECR frontend</div></div>
+              </div>
+            </div>
+
+            <!-- Backend -->
+            <div class="lane dashed">
+              <span class="lane-label">expense-backend</span>
+              <div class="row">
+                <div class="box"><div>Pod ×2</div><div class="box-sub">gunicorn · port 8080</div></div>
+                <div class="arrow"><span class="arrow-lbl">probe GET /</span><span class="arrow-sym">→</span></div>
+                <div class="box"><div>Service</div><div class="box-sub">ClusterIP · port 8080</div></div>
+                <div class="arrow"><span class="arrow-lbl">IRSA</span><span class="arrow-sym">→</span></div>
+                <div class="box accent"><div>DynamoDB</div><div class="box-sub">expenses table</div></div>
+                <div class="flex1"></div>
+                <div class="arrow"><span class="arrow-lbl">pull image</span><span class="arrow-sym">→</span></div>
+                <div class="box dim"><div>ECR backend</div></div>
+              </div>
+              <p class="irsa-note">ServiceAccount: expense-backend — annotation: eks.amazonaws.com/role-arn → backend-role (DynamoDB 读写权限)</p>
+            </div>
+
+          </div>
+        </div>
+
+        <!-- Node Groups -->
+        <div class="lane">
+          <span class="lane-label">Managed Node Groups</span>
+          <div class="row">
+            <div class="box dim flex1"><div>apps nodegroup</div><div class="box-sub">EC2 · private subnet</div></div>
+            <div class="box dim flex1"><div>default nodegroup</div><div class="box-sub">EC2 · private subnet</div></div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="section-gap"></div>
+<hr class="divider">
+<div class="small-gap"></div>
+
+<!-- Traffic Flow -->
+<h3>Traffic Flow</h3>
+<div class="flow">
+  <div class="box dim" style="min-width:auto;padding:6px 12px">User Browser</div>
+  <div style="text-align:center"><div class="flow-label">HTTP:80</div><div class="flow-arrow">→</div></div>
+  <div class="box accent" style="min-width:auto;padding:6px 12px">ALB</div>
+  <div style="text-align:center"><div class="flow-label">/ prefix</div><div class="flow-arrow">→</div></div>
+  <div class="box" style="min-width:auto;padding:6px 12px">frontend Pod</div>
+  <div style="text-align:center"><div class="flow-label">/expenses /months /summary</div><div class="flow-arrow">→</div></div>
+  <div class="box accent" style="min-width:auto;padding:6px 12px">backend Pod</div>
+  <div style="text-align:center"><div class="flow-label">IRSA · IAM</div><div class="flow-arrow">→</div></div>
+  <div class="box" style="min-width:auto;padding:6px 12px">DynamoDB</div>
+</div>
+
+<div class="section-gap"></div>
+<hr class="divider">
+<div class="small-gap"></div>
+
+<!-- Key Config -->
+<h3>关键配置 / 今天的踩坑点</h3>
+<div class="config-grid">
+  <div class="config-card">
+    <div class="cfg-label">Probe path</div>
+    <div class="cfg-value">GET / (not /expenses)</div>
+    <div class="cfg-note">稳定返回 200；/expenses 缺 month 参数返回 400 导致 CrashLoop</div>
+  </div>
+  <div class="config-card">
+    <div class="cfg-label">IRSA</div>
+    <div class="cfg-value">eks.amazonaws.com/role-arn</div>
+    <div class="cfg-note">SA annotation；本地 envsubst 未带变量会渲染为空，导致 DynamoDB 无权限</div>
+  </div>
+  <div class="config-card">
+    <div class="cfg-label">LBC keepTLSSecret</div>
+    <div class="cfg-value">--set keepTLSSecret=true</div>
+    <div class="cfg-note">避免每次 helm upgrade 轮换 webhook CA，防止 x509 unknown authority</div>
+  </div>
+  <div class="config-card">
+    <div class="cfg-label">Target type</div>
+    <div class="cfg-value">ip（not instance）</div>
+    <div class="cfg-note">ALB 直接路由到 Pod IP；Pod Ready → EndpointSlice → TG target 注册</div>
+  </div>
+  <div class="config-card">
+    <div class="cfg-label">ALB SG tag</div>
+    <div class="cfg-value">ingress.k8s.aws/cluster</div>
+    <div class="cfg-note">LBC 通过此 tag 识别和管理 ALB SG；缺失会导致 IAM 403</div>
+  </div>
+  <div class="config-card">
+    <div class="cfg-label">VpcId (Helm)</div>
+    <div class="cfg-value">--set vpcId=&lt;vpc-id&gt;</div>
+    <div class="cfg-note">IMDS hop limit=1 时无法自动发现 VPC；CI 用 aws eks describe-cluster 动态取值</div>
+  </div>
+</div>
+
+<div class="section-gap"></div>
+<p style="font-size:10px; color:#444">expenseapp · expenseinfra · Terraform EKS module · GitLab deploy-eks job · ca-central-1</p>
+
+</body>
+</html>

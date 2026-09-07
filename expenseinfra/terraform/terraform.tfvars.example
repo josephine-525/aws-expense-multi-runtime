@@ -1,0 +1,11 @@
+# Prefer committed environment files under terraform/environments/.
+# CI uses environments/prod.tfvars by default.
+#
+# Keep terraform.tfvars for local-only overrides if needed.
+
+# Runtime mode (preferred): lambda | ecs | eks
+# deployment_mode = "lambda"
+
+# Path to expenseapp repo (frontend/index.html.tpl + backend/lambda/handler.py).
+# Leave unset to use ../../expenseapp relative to this terraform/ directory.
+# expenseapp_repo_path = "/absolute/path/to/expenseapp"

@@ -1,0 +1,434 @@
+spec:
+  inputs:
+    deployment_mode:
+      type: string
+      default: "eks"
+      options:
+        - "lambda"
+        - "ecs"
+        - "eks"
+      description: "Choose runtime pipeline path: lambda package, ecs deploy, or eks deploy."
+---
+# Multi-runtime app pipeline: lambda | ecs | eks
+# - lambda: package lambda source artifact placeholder (for runtime-lambda track)
+# - ecs: build/push images to ECR, then force ECS service redeploy
+# - eks: build/push images to ECR, then deploy placeholder (kubectl/helm step)
+#
+# GitLab → CI/CD → Variables:
+# AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION (required; e.g. ca-central-1),
+# PROJECT_NAME (= Terraform project_name), DEPLOYMENT_MODE=lambda|ecs|eks.
+# EKS: EKS_EXPENSE_BACKEND_ROLE_ARN, EKS_AWS_LBC_ROLE_ARN, and EKS_ALB_SG_ID are NOT CI/CD variables —
+#   they're read at deploy time from SSM parameters published by expenseinfra's runtime-eks module:
+#   /${PROJECT_NAME}/expense/eks-expense-backend-role-arn, /${PROJECT_NAME}/expense/eks-aws-lbc-role-arn,
+#   /${PROJECT_NAME}/expense/eks-alb-security-group-id.
+#   IAM for the CI user: ssm:GetParameter on those parameter ARNs.
+# EKS: GRAFANA_ADMIN_PASSWORD (required, masked) — admin password for the kube-prometheus-stack
+#   Grafana install. Grafana/Prometheus have no Ingress; reach them via kubectl port-forward
+#   (commands printed at the end of the deploy-eks job).
+# EKS: GITOPS_PUSH_TOKEN (required, masked) — GitLab personal access token, write_repository
+#   scope, scoped to this project. Two uses: (1) ArgoCD's read credential for pulling this repo,
+#   (2) CI's write credential for committing rendered manifests to k8s/rendered/. deploy-eks no
+#   longer applies eks-workload.yaml/eks-serviceaccount.yaml directly — it renders them, pushes
+#   to git, and ArgoCD (installed by this job, namespace argocd, no Ingress — port-forward only)
+#   detects the diff and syncs. Manual kubectl edits against these resources will be reverted by
+#   ArgoCD's selfHeal.
+# Optional: ECR_BACKEND_REPO, ECR_FRONTEND_REPO (must match Terraform ecr_expense_* names).
+#
+# Release tag v001, v002, … : default-branch pipeline bumps SSM parameter
+#   /${PROJECT_NAME}/expense/image-release-seq (Terraform creates it at "0"). No manual file edits.
+# IAM for the CI user: ssm:GetParameter + ssm:PutParameter on that parameter ARN.
+#
+# amazon/aws-cli image ENTRYPOINT is "aws"; GitLab runs scripts via sh, so clear entrypoint (same idea as hashicorp/terraform in expenseinfra).
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+
+stages:
+  - release
+  - build
+  - deploy
+
+variables:
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_HOST: tcp://docker:2375
+  DEPLOYMENT_MODE: $[[ inputs.deployment_mode ]]
+  K8S_NAMESPACE: "expense"
+  EKS_CLUSTER_NAME: ""
+  DYNAMODB_TABLE_NAME: ""
+
+.default-branch-rule: &default_branch_rule
+  if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+.ecs-or-eks-rule: &ecs_or_eks_rule
+  if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DEPLOYMENT_MODE =~ /^(ecs|eks)$/'
+
+.lambda-rule: &lambda_rule
+  if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DEPLOYMENT_MODE == "lambda"'
+
+resolve-version:
+  image:
+    name: amazon/aws-cli:latest
+    entrypoint: [""]
+  stage: release
+  rules:
+    - *ecs_or_eks_rule
+  before_script:
+    - |
+      if [ -z "${PROJECT_NAME:-}" ]; then
+        echo "Set CI/CD variable PROJECT_NAME to match Terraform project_name." >&2
+        exit 1
+      fi
+      if [ -z "${AWS_DEFAULT_REGION:-}" ]; then
+        echo "Set CI/CD variable AWS_DEFAULT_REGION (e.g. ca-central-1). Empty region causes aws ParamValidationError." >&2
+        exit 1
+      fi
+      if [ "${DEPLOYMENT_MODE}" != "ecs" ] && [ "${DEPLOYMENT_MODE}" != "eks" ]; then
+        echo "resolve-version runs only for DEPLOYMENT_MODE=ecs|eks." >&2
+        exit 1
+      fi
+  script:
+    - |
+      export PARAM_NAME="/${PROJECT_NAME}/expense/image-release-seq"
+      CUR=$(aws ssm get-parameter --name "$PARAM_NAME" --region "$AWS_DEFAULT_REGION" --query 'Parameter.Value' --output text)
+      NEXT=$((10#$CUR + 1))
+      aws ssm put-parameter --name "$PARAM_NAME" --value "$NEXT" --type String --overwrite --region "$AWS_DEFAULT_REGION"
+      export IMAGE_VERSION="v$(printf '%03d' "$NEXT")"
+      echo "IMAGE_VERSION=$IMAGE_VERSION" | tee build.env
+      echo "Tagged images with $IMAGE_VERSION (SSM counter is now $NEXT)"
+  artifacts:
+    reports:
+      dotenv: build.env
+
+.docker_dind:
+  image: docker:24-cli
+  services:
+    - name: docker:24-dind
+      alias: docker
+  before_script:
+    # Alpine Python/awscli hits pyexpat+musl/expat bugs; delegate to official amazon/aws-cli image via docker (glibc).
+    - echo 'IyEvYmluL3NoCmV4ZWMgZG9ja2VyIHJ1biAtLXJtIC1lIEFXU19BQ0NFU1NfS0VZX0lEIC1lIEFXU19TRUNSRVRfQUNDRVNTX0tFWSAtZSBBV1NfU0VTU0lPTl9UT0tFTiAtZSBBV1NfREVGQVVMVF9SRUdJT04gYW1hem9uL2F3cy1jbGk6bGF0ZXN0ICIkQCIK' | base64 -d > /usr/local/bin/aws
+    - chmod +x /usr/local/bin/aws
+    - docker pull amazon/aws-cli:latest
+    - |
+      if [ -z "${PROJECT_NAME:-}" ]; then
+        echo "Set CI/CD variable PROJECT_NAME." >&2
+        exit 1
+      fi
+      if [ -z "${AWS_DEFAULT_REGION:-}" ]; then
+        echo "Set CI/CD variable AWS_DEFAULT_REGION (e.g. ca-central-1)." >&2
+        exit 1
+      fi
+    - export ECR_BACKEND="${ECR_BACKEND_REPO:-${PROJECT_NAME}-expense-backend}"
+    - export ECR_FRONTEND="${ECR_FRONTEND_REPO:-${PROJECT_NAME}-expense-frontend}"
+    - aws sts get-caller-identity
+    - export AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+    - export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+    - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+    - echo "ECR backend=$ECR_BACKEND frontend=$ECR_FRONTEND IMAGE_VERSION=${IMAGE_VERSION}"
+
+build-backend:
+  extends: .docker_dind
+  stage: build
+  needs: ["resolve-version"]
+  rules:
+    - *ecs_or_eks_rule
+  script:
+    - docker build -t "local-backend:${CI_COMMIT_SHA}" ./backend
+    - docker tag "local-backend:${CI_COMMIT_SHA}" "${ECR_REGISTRY}/${ECR_BACKEND}:latest"
+    - docker tag "local-backend:${CI_COMMIT_SHA}" "${ECR_REGISTRY}/${ECR_BACKEND}:${CI_COMMIT_SHA}"
+    - docker tag "local-backend:${CI_COMMIT_SHA}" "${ECR_REGISTRY}/${ECR_BACKEND}:${IMAGE_VERSION}"
+    - docker push "${ECR_REGISTRY}/${ECR_BACKEND}:latest"
+    - docker push "${ECR_REGISTRY}/${ECR_BACKEND}:${CI_COMMIT_SHA}"
+    - docker push "${ECR_REGISTRY}/${ECR_BACKEND}:${IMAGE_VERSION}"
+
+build-frontend:
+  extends: .docker_dind
+  stage: build
+  needs: ["resolve-version"]
+  rules:
+    - *ecs_or_eks_rule
+  script:
+    - |
+      if [ "${DEPLOYMENT_MODE}" = "eks" ]; then
+        docker build --build-arg API_BASE= --build-arg EKS_PROXY=1 \
+          -t "local-frontend:${CI_COMMIT_SHA}" -f frontend/Dockerfile frontend
+      else
+        docker build --build-arg API_BASE= \
+          -t "local-frontend:${CI_COMMIT_SHA}" -f frontend/Dockerfile frontend
+      fi
+    - docker tag "local-frontend:${CI_COMMIT_SHA}" "${ECR_REGISTRY}/${ECR_FRONTEND}:latest"
+    - docker tag "local-frontend:${CI_COMMIT_SHA}" "${ECR_REGISTRY}/${ECR_FRONTEND}:${CI_COMMIT_SHA}"
+    - docker tag "local-frontend:${CI_COMMIT_SHA}" "${ECR_REGISTRY}/${ECR_FRONTEND}:${IMAGE_VERSION}"
+    - docker push "${ECR_REGISTRY}/${ECR_FRONTEND}:latest"
+    - docker push "${ECR_REGISTRY}/${ECR_FRONTEND}:${CI_COMMIT_SHA}"
+    - docker push "${ECR_REGISTRY}/${ECR_FRONTEND}:${IMAGE_VERSION}"
+
+package-lambda:
+  image: alpine:3.20
+  stage: build
+  rules:
+    - *lambda_rule
+  script:
+    - test -f backend/lambda/handler.py
+    - mkdir -p dist/lambda
+    - cp backend/lambda/handler.py dist/lambda/handler.py
+    - cd dist/lambda && tar -czf ../lambda-source.tar.gz handler.py
+    - echo "Prepared lambda source artifact for runtime-lambda track."
+  artifacts:
+    paths:
+      - dist/lambda-source.tar.gz
+
+deploy-ecs:
+  image:
+    name: amazon/aws-cli:latest
+    entrypoint: [""]
+  stage: deploy
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DEPLOYMENT_MODE == "ecs"'
+  needs:
+    - job: build-backend
+    - job: build-frontend
+  before_script:
+    - |
+      if [ -z "${PROJECT_NAME:-}" ]; then
+        echo "Set CI/CD variable PROJECT_NAME." >&2
+        exit 1
+      fi
+      if [ -z "${AWS_DEFAULT_REGION:-}" ]; then
+        echo "Set CI/CD variable AWS_DEFAULT_REGION (e.g. ca-central-1)." >&2
+        exit 1
+      fi
+  script:
+    - export ECS_CLUSTER="${PROJECT_NAME}-expense"
+    - export SVC_API="${PROJECT_NAME}-expense-api"
+    - export SVC_WEB="${PROJECT_NAME}-expense-web"
+    - aws ecs update-service --cluster "$ECS_CLUSTER" --service "$SVC_API" --region "$AWS_DEFAULT_REGION" --force-new-deployment
+    - aws ecs update-service --cluster "$ECS_CLUSTER" --service "$SVC_WEB" --region "$AWS_DEFAULT_REGION" --force-new-deployment
+
+deploy-eks:
+  image: alpine:3.20
+  stage: deploy
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DEPLOYMENT_MODE == "eks"'
+  needs:
+    - job: resolve-version
+      artifacts: true
+    - job: build-backend
+    - job: build-frontend
+  before_script:
+    - apk add --no-cache aws-cli kubectl gettext helm git
+    - |
+      if [ -z "${PROJECT_NAME:-}" ]; then
+        echo "Set CI/CD variable PROJECT_NAME." >&2
+        exit 1
+      fi
+      if [ -z "${AWS_DEFAULT_REGION:-}" ]; then
+        echo "Set CI/CD variable AWS_DEFAULT_REGION (e.g. ca-central-1)." >&2
+        exit 1
+      fi
+      export EKS_CLUSTER="${EKS_CLUSTER_NAME:-${PROJECT_NAME}-expense-eks}"
+      export ECR_BACKEND="${ECR_BACKEND_REPO:-${PROJECT_NAME}-expense-backend}"
+      export ECR_FRONTEND="${ECR_FRONTEND_REPO:-${PROJECT_NAME}-expense-frontend}"
+      export TABLE_NAME="${DYNAMODB_TABLE_NAME:-${PROJECT_NAME}-expenses}"
+      if [ -z "${IMAGE_VERSION:-}" ]; then
+        echo "IMAGE_VERSION is empty. Ensure resolve-version succeeded and its dotenv artifact is available." >&2
+        exit 1
+      fi
+      echo "=== caller identity ===" && aws sts get-caller-identity
+      export AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+      export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      export BACKEND_IMAGE="${ECR_REGISTRY}/${ECR_BACKEND}:${IMAGE_VERSION}"
+      export FRONTEND_IMAGE="${ECR_REGISTRY}/${ECR_FRONTEND}:${IMAGE_VERSION}"
+      export EKS_EXPENSE_BACKEND_ROLE_ARN="$(aws ssm get-parameter --name "/${PROJECT_NAME}/expense/eks-expense-backend-role-arn" --region "$AWS_DEFAULT_REGION" --query 'Parameter.Value' --output text)"
+      if [ -z "${EKS_EXPENSE_BACKEND_ROLE_ARN:-}" ]; then
+        echo "Failed to read /${PROJECT_NAME}/expense/eks-expense-backend-role-arn from SSM. Ensure expenseinfra has been applied with deployment_mode=eks and the CI IAM identity has ssm:GetParameter on that parameter." >&2
+        exit 1
+      fi
+      export EKS_AWS_LBC_ROLE_ARN="$(aws ssm get-parameter --name "/${PROJECT_NAME}/expense/eks-aws-lbc-role-arn" --region "$AWS_DEFAULT_REGION" --query 'Parameter.Value' --output text)"
+      if [ -z "${EKS_AWS_LBC_ROLE_ARN:-}" ]; then
+        echo "Failed to read /${PROJECT_NAME}/expense/eks-aws-lbc-role-arn from SSM. Ensure expenseinfra has been applied with deployment_mode=eks and the CI IAM identity has ssm:GetParameter on that parameter." >&2
+        exit 1
+      fi
+      export EKS_ALB_SG_ID="$(aws ssm get-parameter --name "/${PROJECT_NAME}/expense/eks-alb-security-group-id" --region "$AWS_DEFAULT_REGION" --query 'Parameter.Value' --output text)"
+      if [ -z "${EKS_ALB_SG_ID:-}" ]; then
+        echo "Failed to read /${PROJECT_NAME}/expense/eks-alb-security-group-id from SSM. Ensure expenseinfra has been applied with deployment_mode=eks and the CI IAM identity has ssm:GetParameter on that parameter." >&2
+        exit 1
+      fi
+      aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_DEFAULT_REGION"
+      echo "=== kubectl auth check ===" && kubectl auth can-i get pods -n expense || true
+      echo "=== access entries ===" && aws eks list-access-entries --cluster-name "$EKS_CLUSTER" --region "$AWS_DEFAULT_REGION" || true
+  script:
+    - kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply --validate=false -f -
+    - |
+      VPC_ID=$(aws eks describe-cluster \
+        --name "$EKS_CLUSTER" \
+        --region "$AWS_DEFAULT_REGION" \
+        --query 'cluster.resourcesVpcConfig.vpcId' \
+        --output text)
+      echo "Using VPC_ID=$VPC_ID"
+      helm repo add eks https://aws.github.io/eks-charts
+      helm repo update
+      # keepTLSSecret: avoid rotating webhook CA every helm upgrade (v3.x); else caBundle vs pod cert drift → x509 unknown authority on Ingress apply.
+      # Rollout restart: helm may not restart pods; stale pods + new webhook CA causes the same TLS error (aws/eks-charts#562, kubernetes-sigs/aws-load-balancer-controller#4572).
+      helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+        --namespace kube-system \
+        --set clusterName="$EKS_CLUSTER" \
+        --set region="$AWS_DEFAULT_REGION" \
+        --set vpcId="$VPC_ID" \
+        --set serviceAccount.create=true \
+        --set serviceAccount.name=aws-load-balancer-controller \
+        --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$EKS_AWS_LBC_ROLE_ARN" \
+        --set keepTLSSecret=true \
+        --set createIngressClassResource=true \
+        --set ingressClass=alb
+      kubectl rollout restart deployment/aws-load-balancer-controller -n kube-system
+    - kubectl rollout status deployment/aws-load-balancer-controller -n kube-system --timeout=600s
+    - |
+      # Metrics (Prometheus + Grafana) + logs/Container Insights (CloudWatch addon, installed by
+      # expenseinfra) — kube-prometheus-stack bundles node-exporter, kube-state-metrics and default
+      # Kubernetes dashboards. Storage is ephemeral (emptyDir): no EBS CSI driver is installed, and
+      # this is a learning cluster, so metrics history is lost on pod restart — acceptable trade-off.
+      # Grafana is reached via `kubectl port-forward` only (no Ingress) — see deploy job output below.
+      if [ -z "${GRAFANA_ADMIN_PASSWORD:-}" ]; then
+        echo "Set GitLab CI/CD variable GRAFANA_ADMIN_PASSWORD (masked) before first deploy." >&2
+        exit 1
+      fi
+      helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+      helm repo update
+      helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+        --namespace monitoring --create-namespace \
+        --set grafana.adminPassword="$GRAFANA_ADMIN_PASSWORD" \
+        --set grafana.service.type=ClusterIP \
+        --set prometheus.service.type=ClusterIP \
+        --wait --timeout 10m
+    - |
+      # ArgoCD — GitOps controller. UI is port-forward only (no Ingress), same policy as Grafana:
+      #   kubectl -n argocd port-forward svc/argocd-server 8081:443
+      # Initial admin password: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d
+      helm repo add argo https://argoproj.github.io/argo-helm
+      helm repo update
+      # dex/notifications/applicationSet disabled — no SSO, no notification channel, and a single
+      # Application doesn't need the ApplicationSet controller. Trims pod count on tight t3.medium nodes.
+      helm upgrade --install argocd argo/argo-cd \
+        --namespace argocd --create-namespace \
+        --set server.service.type=ClusterIP \
+        --set dex.enabled=false \
+        --set notifications.enabled=false \
+        --set applicationSet.enabled=false \
+        --wait --timeout 10m
+    - |
+      # Repo credentials so ArgoCD can pull this (private) repo. Reuses the same
+      # write-scoped token CI pushes with below — a real prod setup would split this
+      # into two least-privilege tokens (read-only for ArgoCD, write for CI); one
+      # token is a scoped-down trade-off acceptable for a learning project.
+      if [ -z "${GITOPS_PUSH_TOKEN:-}" ]; then
+        echo "Set GitLab CI/CD variable GITOPS_PUSH_TOKEN (masked, write_repository scope) before first deploy." >&2
+        exit 1
+      fi
+      kubectl apply -f - <<EOF
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: expenseapp-repo-creds
+        namespace: argocd
+        labels:
+          argocd.argoproj.io/secret-type: repository
+      stringData:
+        type: git
+        url: ${CI_PROJECT_URL}.git
+        username: oauth2
+        password: ${GITOPS_PUSH_TOKEN}
+      EOF
+      envsubst < k8s/argocd-application.yaml | kubectl apply --validate=false -f -
+    - |
+      # Render manifests and push to git instead of applying directly — ArgoCD (above)
+      # picks up the diff and syncs/rolls out the change. This is the actual GitOps loop.
+      # Sync local main to the remote tip first: the runner's checkout can be behind if a
+      # previous deploy already pushed a commit (e.g. a retried job) — pushing from a stale
+      # local branch is a non-fast-forward rejection, not an auth error.
+      git config user.email "gitlab-ci@expenseapp.local"
+      git config user.name "GitLab CI"
+      git fetch origin "${CI_DEFAULT_BRANCH}"
+      git checkout -B "${CI_DEFAULT_BRANCH}" "origin/${CI_DEFAULT_BRANCH}"
+      mkdir -p k8s/rendered
+      envsubst < k8s/eks-serviceaccount.yaml > k8s/rendered/eks-serviceaccount.yaml
+      envsubst < k8s/eks-workload.yaml > k8s/rendered/eks-workload.yaml
+      cp k8s/expense-grafana-dashboard.yaml k8s/rendered/expense-grafana-dashboard.yaml
+      git add k8s/rendered
+      if git diff --cached --quiet; then
+        echo "No manifest changes to commit — image tag / config already matches git."
+      else
+        git commit -m "deploy: ${IMAGE_VERSION} to eks"
+        git push "https://oauth2:${GITOPS_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
+      fi
+    - |
+      echo "Waiting for ArgoCD to sync expenseapp Application..."
+      i=0
+      while [ "$i" -lt 36 ]; do
+        SYNC=$(kubectl -n argocd get application expenseapp -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+        HEALTH=$(kubectl -n argocd get application expenseapp -o jsonpath='{.status.health.status}' 2>/dev/null || true)
+        echo "sync=${SYNC:-<none>} health=${HEALTH:-<none>}"
+        if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
+          break
+        fi
+        i=$((i + 1))
+        sleep 5
+      done
+      if [ "$SYNC" != "Synced" ] || [ "$HEALTH" != "Healthy" ]; then
+        echo "ERROR: ArgoCD did not reach Synced+Healthy within 3 minutes (sync=$SYNC health=$HEALTH)." >&2
+        kubectl -n argocd get application expenseapp -o yaml || true
+        exit 1
+      fi
+    - kubectl rollout status deployment/expense-backend -n "$K8S_NAMESPACE" --timeout=300s
+    - kubectl rollout status deployment/expense-frontend -n "$K8S_NAMESPACE" --timeout=300s
+    - kubectl get svc -n "$K8S_NAMESPACE"
+    - kubectl get ingressclass
+    - kubectl get ingress -n "$K8S_NAMESPACE"
+    - kubectl describe ingress expense -n "$K8S_NAMESPACE"
+    - |
+      echo "Waiting for AWS Load Balancer Controller to provision an ALB..."
+      i=0
+      while [ "$i" -lt 36 ]; do
+        CLASS=$(kubectl get ingress expense -n "$K8S_NAMESPACE" -o jsonpath='{.spec.ingressClassName}' 2>/dev/null || true)
+        HOST=$(kubectl get ingress expense -n "$K8S_NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+        if [ "$CLASS" != "alb" ]; then
+          echo "ERROR: Ingress class is '${CLASS:-<none>}'; expected alb (spec.ingressClassName)." >&2
+          kubectl describe ingress expense -n "$K8S_NAMESPACE" || true
+          exit 1
+        fi
+        if [ -n "$HOST" ]; then
+          echo "ALB hostname: $HOST"
+          break
+        fi
+        i=$((i + 1))
+        sleep 5
+      done
+      if [ -z "${HOST:-}" ]; then
+        echo "ERROR: LBC did not assign an ALB hostname within 3 minutes. Check aws-load-balancer-controller logs." >&2
+        kubectl -n kube-system logs deploy/aws-load-balancer-controller --tail=80 || true
+        kubectl describe ingress expense -n "$K8S_NAMESPACE" || true
+        exit 1
+      fi
+    - |
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "Monitoring:"
+      echo "  Grafana (no public Ingress — port-forward only):"
+      echo "    kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 3001:80"
+      echo "    open http://localhost:3001  (user: admin, password: GRAFANA_ADMIN_PASSWORD CI variable)"
+      echo "  Prometheus:"
+      echo "    kubectl -n monitoring port-forward svc/kube-prometheus-stack-prometheus 9090:9090"
+      echo "  CloudWatch Container Insights logs (CloudWatch console → Logs → Log groups):"
+      echo "    /aws/containerinsights/${EKS_CLUSTER}/application  (pod stdout/stderr)"
+      echo "    /aws/containerinsights/${EKS_CLUSTER}/host         (node-level logs)"
+      echo "    /aws/containerinsights/${EKS_CLUSTER}/dataplane    (kubelet/container runtime)"
+      echo "    CloudWatch console → Container Insights → Performance monitoring shows CPU/mem dashboards."
+      echo "GitOps (ArgoCD):"
+      echo "  UI (no public Ingress — port-forward only):"
+      echo "    kubectl -n argocd port-forward svc/argocd-server 8081:443"
+      echo "    open https://localhost:8081  (user: admin, password below)"
+      echo "    kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+      echo "  Deploys now happen via git push to k8s/rendered/ (see this job's script), not direct kubectl apply."
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

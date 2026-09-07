@@ -1,0 +1,220 @@
+spec:
+  inputs:
+    deployment_mode:
+      type: string
+      default: "eks"
+      options:
+        - "lambda"
+        - "ecs"
+        - "eks"
+      description: "Runtime to plan/apply. Overrides deployment_mode in environments/prod.tfvars for this run."
+    confirm_destroy:
+      type: string
+      default: "false"
+      options:
+        - "false"
+        - "true"
+      description: "Destroy safety latch. Set true only when intentionally destroying infrastructure."
+    destroy_approval:
+      type: string
+      default: ""
+      options:
+        - ""
+        - "YES_DESTROY_INFRA"
+      description: "Second destroy confirmation. Must be YES_DESTROY_INFRA to show destroy jobs."
+---
+# expenseinfra — Terraform checks on GitLab CI.
+# Manual trigger only: this pipeline does NOT run on git push or merge requests.
+# Start it from GitLab → CI/CD → Pipelines → "Run pipeline", where deployment_mode
+# is a dropdown (lambda/ecs/eks) — no need to hand-edit environments/prod.tfvars first.
+#
+# Requires CI/CD variables for `terraform plan` / `apply` (AWS API): AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (masked),
+# and AWS_DEFAULT_REGION (e.g. ca-central-1). Without them, `plan` fails at provider refresh.
+# `apply` is manual and only offered on the default branch.
+# After a successful apply, the apply job prints a short reminder: ECS/EKS still need expenseapp CI (images + deploy).
+#
+# EKS (deployment_mode=eks): optional EKS_ADMIN_PRINCIPAL_ARN → TF_VAR_eks_admin_principal_arn (IAM user/role ARN for kubectl access entry).
+#
+# Destroy-only pipeline: Run pipeline with confirm_destroy=true AND destroy_approval=YES_DESTROY_INFRA — only destroy_plan / destroy_apply appear.
+
+stages:
+  - lint
+  - validate
+  - plan
+  - apply
+  - destroy
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+
+variables:
+  TF_ROOT: terraform
+  TF_IN_AUTOMATION: "true"
+  TF_ENV_VARS_FILE: environments/prod.tfvars
+  DEPLOYMENT_MODE: $[[ inputs.deployment_mode ]]
+  CONFIRM_DESTROY: $[[ inputs.confirm_destroy ]]
+  DESTROY_APPROVAL: $[[ inputs.destroy_approval ]]
+  # GitLab Terraform state name (shown in UI after first successful init/apply).
+
+
+.terraform_base:
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+
+# Share downloaded providers between validate and plan jobs.
+.terraform_cached:
+  cache:
+    key:
+      files:
+        - terraform/.terraform.lock.hcl
+    paths:
+      - terraform/.terraform
+
+# use s3 bucket terraform-state
+
+.terraform_init_backend:
+  before_script:
+    - cd "$TF_ROOT"
+    - test -f "$TF_ENV_VARS_FILE"
+    - export TF_VAR_eks_admin_principal_arn="${EKS_ADMIN_PRINCIPAL_ARN:-}"
+    - export TF_VAR_eks_ci_principal_arn="${EKS_CI_PRINCIPAL_ARN:-}"
+    - terraform init -input=false -reconfigure
+
+# Normal plan/apply path only. Destroy-only web runs set both inputs → these jobs are hidden.
+# Pipeline source is always "web" (see workflow: rules above) — only the branch matters here.
+.terraform_rules: &terraform_rules
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && !($CONFIRM_DESTROY == "true" && $DESTROY_APPROVAL == "YES_DESTROY_INFRA")'
+
+# In CI only expenseinfra is checked out by default; ../expenseapp is missing unless you clone it.
+# Set EXPENSEAPP_PROJECT_PATH (e.g. my-group/expenseapp) and in expenseapp → Settings → CI/CD →
+# Job token permissions, allow this project to read the repository. Or set TF_VAR_expenseapp_repo_path.
+# Anchor reused by plan / apply (avoid !reference — not accepted on all GitLab versions).
+.expenseapp_prepare:
+  script:
+    - &expenseapp_prepare_step |
+      if [ -n "${CI_PROJECT_DIR:-}" ]; then
+        export TF_VAR_expenseapp_repo_path="${TF_VAR_expenseapp_repo_path:-$CI_PROJECT_DIR/../expenseapp}"
+        if [ ! -f "$TF_VAR_expenseapp_repo_path/frontend/index.html.tpl" ] || [ ! -f "$TF_VAR_expenseapp_repo_path/backend/lambda/handler.py" ]; then
+          if [ -z "${EXPENSEAPP_PROJECT_PATH:-}" ]; then
+            echo "expenseapp sources missing at: $TF_VAR_expenseapp_repo_path" >&2
+            echo "Set GitLab CI/CD variable EXPENSEAPP_PROJECT_PATH (namespace/project, e.g. acme/expenseapp) to clone via CI_JOB_TOKEN," >&2
+            echo "or TF_VAR_expenseapp_repo_path to an absolute path, or run a runner that checks out both repos as siblings." >&2
+            exit 1
+          fi
+          CLONE_DEST="${CI_PROJECT_DIR}/../expenseapp"
+          rm -rf "$CLONE_DEST"
+          git clone --depth 1 \
+            "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${EXPENSEAPP_PROJECT_PATH}.git" \
+            "$CLONE_DEST"
+          export TF_VAR_expenseapp_repo_path="$CLONE_DEST"
+        fi
+        test -f "$TF_VAR_expenseapp_repo_path/frontend/index.html.tpl"
+        test -f "$TF_VAR_expenseapp_repo_path/backend/lambda/handler.py"
+      fi
+
+fmt:
+  extends: .terraform_base
+  stage: lint
+  <<: *terraform_rules
+  script:
+    - terraform fmt -check -recursive "$TF_ROOT"
+
+validate:
+  extends:
+    - .terraform_base
+    - .terraform_cached
+    - .terraform_init_backend
+    - .expenseapp_prepare
+  stage: validate
+  <<: *terraform_rules
+  script:
+    - *expenseapp_prepare_step
+    - terraform validate
+
+plan:
+  extends:
+    - .terraform_base
+    - .terraform_cached
+    - .terraform_init_backend
+  stage: plan
+  <<: *terraform_rules
+  needs: ["validate"]
+  script:
+    - *expenseapp_prepare_step
+    - terraform plan -input=false -no-color -var-file="$TF_ENV_VARS_FILE" -var="deployment_mode=$DEPLOYMENT_MODE" -out=plan.cache
+  artifacts:
+    paths:
+      - terraform/plan.cache
+      - terraform/lambda/expense_api/bundle.zip
+
+# Click "Play" in the pipeline UI. Not shown on destroy-only pipelines.
+apply:
+  extends:
+    - .terraform_base
+    - .terraform_cached
+    - .terraform_init_backend
+  stage: apply
+  needs:
+    - job: plan
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && !($CONFIRM_DESTROY == "true" && $DESTROY_APPROVAL == "YES_DESTROY_INFRA")'
+      when: manual
+    - when: never
+  script:
+    - *expenseapp_prepare_step
+    - terraform apply -input=false -auto-approve plan.cache
+    - |
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "Next: expenseapp (separate GitLab project — not triggered from here)"
+      echo "  • deployment_mode=lambda — API/frontend already applied from this repo; no expenseapp CI required."
+      echo "  • deployment_mode=ecs   — Run expenseapp pipeline: build images → ECR, then deploy-ecs (manual if configured)."
+      echo "  • deployment_mode=eks   — Same: build/push images, then deploy-eks with required IRSA/env vars."
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "Selected outputs (null if not applicable for this deployment_mode):"
+      terraform output -no-color expense_app_url 2>/dev/null || true
+      terraform output -no-color cloudfront_url 2>/dev/null || true
+      terraform output -no-color expense_api_endpoint 2>/dev/null || true
+      terraform output -no-color eks_cluster_name 2>/dev/null || true
+      terraform output -no-color ecr_expense_backend_repository_url 2>/dev/null || true
+      terraform output -no-color ecr_expense_frontend_repository_url 2>/dev/null || true
+
+destroy_plan:
+  extends:
+    - .terraform_base
+    - .terraform_cached
+    - .terraform_init_backend
+  stage: destroy
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true" && $CONFIRM_DESTROY == "true" && $DESTROY_APPROVAL == "YES_DESTROY_INFRA"'
+      when: manual
+    - when: never
+  script:
+    - *expenseapp_prepare_step
+    - terraform plan -destroy -input=false -no-color -var-file="$TF_ENV_VARS_FILE" -var="deployment_mode=$DEPLOYMENT_MODE" -out=destroy.cache
+  artifacts:
+    paths:
+      - terraform/destroy.cache
+
+destroy_apply:
+  extends:
+    - .terraform_base
+    - .terraform_cached
+    - .terraform_init_backend
+  stage: destroy
+  needs:
+    - job: destroy_plan
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true" && $CONFIRM_DESTROY == "true" && $DESTROY_APPROVAL == "YES_DESTROY_INFRA"'
+      when: manual
+    - when: never
+  script:
+    - *expenseapp_prepare_step
+    - terraform apply -input=false -auto-approve destroy.cache
+    - terraform state list || true

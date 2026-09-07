@@ -1,0 +1,25 @@
+# ArgoCD watches k8s/rendered/ in THIS repo — CI no longer applies manifests directly.
+# CI renders eks-workload.yaml/eks-serviceaccount.yaml (envsubst) + copies the dashboard
+# ConfigMap into k8s/rendered/, commits, pushes; ArgoCD detects the git diff and syncs.
+# selfHeal: true means manual `kubectl apply`/`edit` against these resources gets
+# reverted back to whatever's in git — that's the point of GitOps, but worth knowing.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: expenseapp
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: ${CI_PROJECT_URL}.git
+    targetRevision: ${CI_DEFAULT_BRANCH}
+    path: k8s/rendered
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: expense
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
