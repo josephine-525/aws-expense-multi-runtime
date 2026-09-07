@@ -19,4 +19,9 @@ The **EKS track is the deep-dive**: beyond just running the app, it covers **Git
 **CI note:** pipelines are written for GitLab; 
 GitHub Actions equivalents are not included — `terraform apply` locally works fine for a portfolio demo.
 
-<img width="628" height="750" alt="image" src="https://github.com/user-attachments/assets/c41d9e0f-786b-455e-8c30-a6a038953283" />
+<img width="500" height="638" alt="image" src="https://github.com/user-attachments/assets/e24b372f-384b-47c9-b67a-d812afd20ae5" />
+
+<img width="1484" height="851" alt="Screenshot 2026-09-05 at 8 06 10 PM" src="https://github.com/user-attachments/assets/22a732be-111c-4237-9512-f6c6ef002e96" />
+
+<img width="1497" height="833" alt="Screenshot 2026-09-05 at 7 57 05 PM" src="https://github.com/user-attachments/assets/534e25e2-2aed-4ef0-bc31-9d8cf665c0fa" />
+
